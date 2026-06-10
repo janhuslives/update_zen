@@ -113,6 +113,7 @@ _active_log_file: Path = LOG_FILE  # updated to config.log_file after Config.loa
 _env_config = os.environ.get("UPDATE_ZEN_CONFIG")
 CONFIG_FILE = Path(_env_config) if _env_config else BASE_DIR / "config.json"
 CREDENTIALS_FILE = BASE_DIR / "credentials.json"
+CRON_CONFIG_DIR = BASE_DIR / "cron_configs"
 
 
 def _to_portable_path(p: Path) -> str:
@@ -174,8 +175,9 @@ def _unportablize_volume_backup(vb: dict) -> dict:
 def _ensure_dirs(config_path: "Path | None" = None) -> None:
     BASE_DIR.mkdir(exist_ok=True)
     SNAPSHOT_DIR.mkdir(exist_ok=True)
+    CRON_CONFIG_DIR.mkdir(exist_ok=True)
     CONFIG_FILE.parent.mkdir(parents=True, exist_ok=True)
-    dirs = [BASE_DIR, SNAPSHOT_DIR, CONFIG_FILE.parent]
+    dirs = [BASE_DIR, SNAPSHOT_DIR, CRON_CONFIG_DIR, CONFIG_FILE.parent]
     if config_path is not None and config_path.parent != CONFIG_FILE.parent:
         config_path.parent.mkdir(parents=True, exist_ok=True)
         dirs.append(config_path.parent)
@@ -190,8 +192,13 @@ def _load_credentials(base_dir: Path = None) -> dict:
     if not path.exists():
         return {}
     try:
-        with open(path) as f:
-            data = json.load(f)
+        raw = path.read_bytes()
+        enc = EncryptionManager(None)
+        if enc.is_encrypted(raw):
+            if _master_password is None:
+                return {}
+            raw = enc.decrypt_bytes(raw, _master_password)
+        data = json.loads(raw)
         return data.get("saved_passwords", {})
     except Exception:
         return {}
@@ -200,8 +207,11 @@ def _load_credentials(base_dir: Path = None) -> dict:
 def _save_credentials(saved_passwords: dict, base_dir: Path = None) -> None:
     """Write saved_passwords to credentials.json with 0600 permissions."""
     path = (base_dir or BASE_DIR) / "credentials.json"
-    with open(path, "w") as f:
-        json.dump({"saved_passwords": saved_passwords}, f, indent=2)
+    raw = (json.dumps({"saved_passwords": saved_passwords}, indent=2) + "\n").encode()
+    if _master_password is not None:
+        raw = EncryptionManager(None).encrypt_bytes(raw, _master_password)
+    with open(path, "wb") as f:
+        f.write(raw)
     path.chmod(0o600)
     os.chown(path, _INVOKING_UID, _INVOKING_GID)
 
@@ -323,8 +333,18 @@ class Config:
             cfg._path = path
             cfg.save()
             return cfg
-        with open(path) as f:
-            data = json.load(f)
+        raw = path.read_bytes()
+        _enc = EncryptionManager(None)
+        if _enc.is_encrypted(raw):
+            if _master_password is None:
+                raise RuntimeError(
+                    f"config.json at {path} is encrypted but no master password is set"
+                )
+            try:
+                raw = _enc.decrypt_bytes(raw, _master_password)
+            except Exception as e:
+                raise RuntimeError(f"Failed to decrypt config.json: {e}") from e
+        data = json.loads(raw)
         defaults = cls()
         cfg = cls(
             snapshot_dir=_from_portable_path(data.get("snapshot_dir", str(defaults.snapshot_dir))),
@@ -399,49 +419,50 @@ class Config:
         return cfg
 
     def save(self) -> None:
-        with open(self._path, "w") as f:
-            json.dump(
-                {
-                    "snapshot_dir": _to_portable_path(self.snapshot_dir),
-                    "log_file": _to_portable_path(self.log_file),
-                    "max_snapshots": self.max_snapshots,
-                    "max_snapshots_overrides": self.max_snapshots_overrides,
-                    "health_timeout_sec": self.health_timeout_sec,
-                    "exclude": self.exclude,
-                    "volume_backup": _portablize_volume_backup(self.volume_backup),
-                    "volume_backup_enabled": self.volume_backup_enabled,
-                    "auto_rollback": self.auto_rollback,
-                    "auto_rollback_disabled": self.auto_rollback_disabled,
-                    "pinned_tags": self.pinned_tags,
-                    "restart_stack_siblings": self.restart_stack_siblings,
-                    "gateway_wait_sec": self.gateway_wait_sec,
-                    "sibling_wait_sec": self.sibling_wait_sec,
-                    "image_export_enabled": self.image_export_enabled,
-                    "image_export_disabled": self.image_export_disabled,
-                    "env_backup_disabled": self.env_backup_disabled,
-                    "registry_alternatives": self.registry_alternatives,
-                    "snapshot_dir_overrides": {
-                        k: _to_portable_path(Path(v))
-                        for k, v in self.snapshot_dir_overrides.items()
-                    },
-                    "pause_for_backup": self.pause_for_backup,
-                    "pause_for_backup_disabled": self.pause_for_backup_disabled,
-                    "encryption": {
-                        **self.encryption,
-                        "saved_passwords": {},  # never write real passwords to config.json
-                    },
-                    "cron_jobs": self.cron_jobs,
-                    "pagination_enabled": self.pagination_enabled,
-                    "hidden_columns": self.hidden_columns,
-                    "container_versions": self.container_versions,
-                    "snapshot_dir_mode": self.snapshot_dir_mode,
-                    "snapshot_file_mode": self.snapshot_file_mode,
-                    "snapshot_permission_overrides": self.snapshot_permission_overrides,
+        raw = (json.dumps(
+            {
+                "snapshot_dir": _to_portable_path(self.snapshot_dir),
+                "log_file": _to_portable_path(self.log_file),
+                "max_snapshots": self.max_snapshots,
+                "max_snapshots_overrides": self.max_snapshots_overrides,
+                "health_timeout_sec": self.health_timeout_sec,
+                "exclude": self.exclude,
+                "volume_backup": _portablize_volume_backup(self.volume_backup),
+                "volume_backup_enabled": self.volume_backup_enabled,
+                "auto_rollback": self.auto_rollback,
+                "auto_rollback_disabled": self.auto_rollback_disabled,
+                "pinned_tags": self.pinned_tags,
+                "restart_stack_siblings": self.restart_stack_siblings,
+                "gateway_wait_sec": self.gateway_wait_sec,
+                "sibling_wait_sec": self.sibling_wait_sec,
+                "image_export_enabled": self.image_export_enabled,
+                "image_export_disabled": self.image_export_disabled,
+                "env_backup_disabled": self.env_backup_disabled,
+                "registry_alternatives": self.registry_alternatives,
+                "snapshot_dir_overrides": {
+                    k: _to_portable_path(Path(v))
+                    for k, v in self.snapshot_dir_overrides.items()
                 },
-                f,
-                indent=2,
-            )
-            f.write("\n")
+                "pause_for_backup": self.pause_for_backup,
+                "pause_for_backup_disabled": self.pause_for_backup_disabled,
+                "encryption": {
+                    **self.encryption,
+                    "saved_passwords": {},  # never write real passwords to config.json
+                },
+                "cron_jobs": self.cron_jobs,
+                "pagination_enabled": self.pagination_enabled,
+                "hidden_columns": self.hidden_columns,
+                "container_versions": self.container_versions,
+                "snapshot_dir_mode": self.snapshot_dir_mode,
+                "snapshot_file_mode": self.snapshot_file_mode,
+                "snapshot_permission_overrides": self.snapshot_permission_overrides,
+            },
+            indent=2,
+        ) + "\n").encode()
+        if _master_password is not None:
+            raw = EncryptionManager(None).encrypt_bytes(raw, _master_password)
+        with open(self._path, "wb") as f:
+            f.write(raw)
         try:
             self._path.chmod(0o600)
             os.chown(self._path, _INVOKING_UID, _INVOKING_GID)
@@ -591,7 +612,11 @@ def _cron_block(container: str, recipe: str, schedule: str,
     if not _cron_validate_container_name(container):
         raise ValueError(f"Unsafe container name for cron: {container!r}")
     mount = (job or {}).get("mount", "")
+    cron_config = (job or {}).get("cron_config")
     cmd = command.format(container=container, mount=mount)
+    if cron_config:
+        cfg_path = str(_from_portable_path(cron_config) / "config.json")
+        cmd = "update_zen --config " + cfg_path + " " + cmd[len("update_zen "):]
     return (
         f"# BEGIN update_zen:{container}:{recipe}\n"
         f"{schedule} {cmd} >> {log_file} 2>&1\n"
@@ -3201,6 +3226,10 @@ def _getchar() -> str:
         return input()
 
 
+# Master password for config-file-at-rest encryption. Set once in main() after
+# startup prompt; None means config files are stored as plaintext.
+_master_password: "str | None" = None
+
 # Per-process password cache. Keys are "container" or "container::/mount".
 # Only populated when encryption mode is "session". Never written to disk.
 _session_cache: dict[str, str] = {}
@@ -3346,6 +3375,34 @@ def _get_password_verified(config: Config, container: str,
             if remaining > 0:
                 print(f"Incorrect password. "
                       f"{remaining} attempt{'s' if remaining != 1 else ''} remaining.")
+            else:
+                print("Too many failed attempts.", file=sys.stderr)
+                sys.exit(1)
+    sys.exit(1)
+
+
+def _prompt_master_password_startup(config_path: Path, max_attempts: int = 3) -> str:
+    """Prompt for the master password at startup, verifying it against the encrypted config."""
+    from cryptography.exceptions import InvalidTag
+    import getpass
+    enc = EncryptionManager(None)
+    raw = config_path.read_bytes()
+    for attempt in range(1, max_attempts + 1):
+        try:
+            pw = getpass.getpass("Master password: ")
+        except (EOFError, KeyboardInterrupt):
+            print()
+            sys.exit(0)
+        if not pw:
+            print("Password cannot be empty.", file=sys.stderr)
+            sys.exit(1)
+        try:
+            enc.decrypt_bytes(raw, pw)
+            return pw
+        except InvalidTag:
+            remaining = max_attempts - attempt
+            if remaining > 0:
+                print(f"Incorrect password. {remaining} attempt{'s' if remaining != 1 else ''} remaining.")
             else:
                 print("Too many failed attempts.", file=sys.stderr)
                 sys.exit(1)
@@ -5711,6 +5768,91 @@ def _interactive_version_select(config: Config, docker: DockerClient,
         Engine(config).update(name, tag=selected_tag, auto_rollback=effective_ar)
 
 
+def _write_cron_config(config: "Config", container: str, recipe: str,
+                       mount: "str | None", password: str) -> Path:
+    """Generate a minimal per-job cron config directory with its own config.json
+    and credentials.json (both plaintext). Returns the job directory path."""
+    job_name = f"{container}_{recipe}"
+    if mount:
+        job_name += f"_{_sanitize_mount_name(mount)}"
+    job_dir = CRON_CONFIG_DIR / job_name
+    job_dir.mkdir(parents=True, exist_ok=True)
+    job_dir.chmod(0o700)
+    os.chown(job_dir, _INVOKING_UID, _INVOKING_GID)
+
+    enc_containers = [container] if config.is_encryption_enabled(container) else []
+    enc_volumes = {}
+    raw_enc_vols = config.encryption.get("encrypt_volumes", {}).get(container)
+    if raw_enc_vols:
+        enc_volumes = {container: raw_enc_vols}
+
+    minimal: dict = {
+        "snapshot_dir": _to_portable_path(config.snapshot_dir),
+        "log_file": _to_portable_path(config.log_file),
+        "max_snapshots": config.max_snapshots,
+        "volume_backup_enabled": config.volume_backup_enabled,
+        "auto_rollback": config.auto_rollback,
+        "health_timeout_sec": config.health_timeout_sec,
+        "pause_for_backup": config.pause_for_backup,
+        "image_export_enabled": config.image_export_enabled,
+        "restart_stack_siblings": config.restart_stack_siblings,
+        "gateway_wait_sec": config.gateway_wait_sec,
+        "sibling_wait_sec": config.sibling_wait_sec,
+        "encryption": {
+            "mode": "saved",
+            "encrypt_containers": enc_containers,
+            "encrypt_volumes": enc_volumes,
+            "saved_passwords": {},
+        },
+    }
+
+    if container in config.snapshot_dir_overrides:
+        minimal["snapshot_dir_overrides"] = {container: config.snapshot_dir_overrides[container]}
+    if container in config.volume_backup:
+        minimal["volume_backup"] = {container: _portablize_volume_backup(
+            {container: config.volume_backup[container]})[container]}
+    if container in config.max_snapshots_overrides:
+        minimal["max_snapshots_overrides"] = {container: config.max_snapshots_overrides[container]}
+    if container in config.snapshot_permission_overrides:
+        minimal["snapshot_permission_overrides"] = {
+            container: config.snapshot_permission_overrides[container]}
+    if container in config.auto_rollback_disabled:
+        minimal["auto_rollback_disabled"] = [container]
+    if container in config.image_export_disabled:
+        minimal["image_export_disabled"] = [container]
+    if container in config.pause_for_backup_disabled:
+        minimal["pause_for_backup_disabled"] = [container]
+    if container in config.env_backup_disabled:
+        minimal["env_backup_disabled"] = [container]
+    if container in config.registry_alternatives:
+        minimal["registry_alternatives"] = {container: config.registry_alternatives[container]}
+    if container in config.pinned_tags:
+        minimal["pinned_tags"] = {container: config.pinned_tags[container]}
+    if config.snapshot_dir_mode != 0o700:
+        minimal["snapshot_dir_mode"] = config.snapshot_dir_mode
+    if config.snapshot_file_mode != 0o600:
+        minimal["snapshot_file_mode"] = config.snapshot_file_mode
+
+    cfg_path = job_dir / "config.json"
+    cfg_path.write_bytes((json.dumps(minimal, indent=2) + "\n").encode())
+    cfg_path.chmod(0o600)
+    os.chown(cfg_path, _INVOKING_UID, _INVOKING_GID)
+
+    saved_pws: dict = {}
+    if password:
+        saved_pws[container] = password
+    for key, pw in config.encryption.get("saved_passwords", {}).items():
+        if key.startswith(f"{container}::"):
+            saved_pws[key] = pw
+
+    cred_path = job_dir / "credentials.json"
+    cred_path.write_bytes((json.dumps({"saved_passwords": saved_pws}, indent=2) + "\n").encode())
+    cred_path.chmod(0o600)
+    os.chown(cred_path, _INVOKING_UID, _INVOKING_GID)
+
+    return job_dir
+
+
 def _interactive_cron_add(config: Config, container: str) -> bool:
     """Prompt the user to pick a recipe and schedule, add to config, and apply.
     Returns True if a job was added."""
@@ -5795,6 +5937,24 @@ def _interactive_cron_add(config: Config, container: str) -> bool:
     entry: dict = {"recipe": recipe_name, "schedule": schedule, "enabled": True}
     if chosen_mount:
         entry["mount"] = chosen_mount
+
+    if config.is_encryption_enabled(container):
+        print(f"\n  {container} has snapshot encryption — a cron config will be generated.")
+        import getpass
+        pw = config.get_saved_password(container)
+        if pw is None:
+            try:
+                pw = getpass.getpass(f"  Container password for {container}: ")
+            except (EOFError, KeyboardInterrupt):
+                print()
+                print("  Skipping cron config — job may fail if saved password is absent.")
+                pw = None
+        if pw:
+            job_dir = _write_cron_config(config, container, recipe_name,
+                                         chosen_mount or None, pw)
+            entry["cron_config"] = _to_portable_path(job_dir)
+            print(f"  Cron config: {job_dir}")
+
     jobs = list(existing_jobs)
     jobs.append(entry)
     config.cron_jobs[container] = jobs
@@ -7007,12 +7167,15 @@ def _interactive_encryption_menu(config: Config,
         if not enc_containers:
             print("  (no containers encrypted — use the action menu key 'e' to enable per container)")
         print()
+        cfg_enc_status = "enabled" if EncryptionManager(None).is_encrypted(
+            config._path.read_bytes()) else "disabled"
         print("  1  Saved passwords")
         print(f"  2  Password mode         (current: {mode})")
         print("  3  Per-container status")
+        print(f"  4  Config file encryption (currently: {cfg_enc_status})")
         print()
         try:
-            raw = input("[1-3], 0 to go back, q to quit: ").strip()
+            raw = input("[1-4], 0 to go back, q to quit: ").strip()
         except (EOFError, KeyboardInterrupt):
             print()
             return config, enc
@@ -7024,6 +7187,9 @@ def _interactive_encryption_menu(config: Config,
 
         if raw == "1":
             _interactive_saved_passwords_menu(config)
+
+        elif raw == "4":
+            _interactive_config_encryption_menu(config)
 
         elif raw == "2":
             # Mode selector
@@ -7086,6 +7252,105 @@ def _interactive_encryption_menu(config: Config,
                     _interactive_password_menu(config, chosen)
                 else:
                     print("Invalid choice.")
+
+        else:
+            print("Invalid choice.")
+
+
+def _interactive_config_encryption_menu(config: "Config") -> None:
+    """Enable, disable, or change the master password for config-file-at-rest encryption."""
+    import getpass
+    from cryptography.exceptions import InvalidTag
+    global _master_password
+
+    while True:
+        is_enc = EncryptionManager(None).is_encrypted(config._path.read_bytes())
+        status = "ENABLED" if is_enc else "disabled"
+        print(f"\n─── Config file encryption ─────────────────────────")
+        print(f"  Status : {status}")
+        if is_enc:
+            print("  Both config.json and credentials.json are encrypted at rest.")
+            print("  The master password is required every time Update Zen starts.")
+        else:
+            print("  Config files are stored as plaintext (protected by file permissions).")
+        print()
+        if is_enc:
+            print("  1  Change master password")
+            print("  2  Disable (decrypt config files)")
+        else:
+            print("  1  Enable (encrypt config files)")
+        print()
+        try:
+            raw = input("[1-2], 0 to go back: ").strip()
+        except (EOFError, KeyboardInterrupt):
+            print()
+            return
+        if raw == "0":
+            return
+
+        if not is_enc and raw == "1":
+            print()
+            try:
+                pw1 = getpass.getpass("New master password: ")
+            except (EOFError, KeyboardInterrupt):
+                print()
+                continue
+            if not pw1:
+                print("Password cannot be empty.")
+                continue
+            try:
+                pw2 = getpass.getpass("Confirm master password: ")
+            except (EOFError, KeyboardInterrupt):
+                print()
+                continue
+            if pw1 != pw2:
+                print("Passwords do not match.")
+                continue
+            _master_password = pw1
+            config.save()
+            _save_credentials(config.encryption["saved_passwords"], config._path.parent)
+            print("  Config files encrypted. Master password required at every startup.")
+            print("  Cron jobs on non-encrypted containers continue working unchanged.")
+            print("  For encrypted containers, set up cron via the container menu to")
+            print("  generate a standalone cron config that does not need the master password.")
+
+        elif is_enc and raw == "1":
+            print()
+            try:
+                pw1 = getpass.getpass("New master password: ")
+            except (EOFError, KeyboardInterrupt):
+                print()
+                continue
+            if not pw1:
+                print("Password cannot be empty.")
+                continue
+            try:
+                pw2 = getpass.getpass("Confirm master password: ")
+            except (EOFError, KeyboardInterrupt):
+                print()
+                continue
+            if pw1 != pw2:
+                print("Passwords do not match.")
+                continue
+            _master_password = pw1
+            config.save()
+            _save_credentials(config.encryption["saved_passwords"])
+            print("  Master password updated.")
+
+        elif is_enc and raw == "2":
+            print()
+            try:
+                yn = input("Decrypt config files and disable master password? [y/N]: ").strip().lower()
+            except (EOFError, KeyboardInterrupt):
+                print()
+                continue
+            if yn != "y":
+                continue
+            saved_pws = dict(config.encryption["saved_passwords"])
+            _master_password = None
+            config.save()
+            _save_credentials(saved_pws, config._path.parent)
+            print("  Config files are now plaintext. No master password required at startup.")
 
         else:
             print("Invalid choice.")
@@ -8769,6 +9034,14 @@ def cmd_cron(args: argparse.Namespace) -> None:
         config.cron_jobs[container] = jobs
         config.save()
 
+        if config.is_encryption_enabled(container):
+            print(
+                f"Warning: {container} has snapshot encryption enabled.\n"
+                "  The cron job was saved but has no standalone cron config.\n"
+                "  Open the container cron menu in the TUI to generate one,\n"
+                "  or the job will fail to read saved passwords at runtime."
+            )
+
         try:
             changes = _cron_apply(config, container)
         except RuntimeError as e:
@@ -9357,8 +9630,25 @@ def main() -> None:
             _hint = ""
         print(f"Error: could not create required directories: {e}{_hint}", file=sys.stderr)
         sys.exit(1)
+
+    global _master_password, _active_log_file
+    if _config_path.exists():
+        _raw_cfg = _config_path.read_bytes()
+        if EncryptionManager(None).is_encrypted(_raw_cfg):
+            if not sys.stdin.isatty():
+                print(
+                    "Error: config.json is encrypted; cannot prompt for master password "
+                    "in non-TTY mode.",
+                    file=sys.stderr,
+                )
+                print(
+                    "  Use a per-job cron config (--config PATH) for automated invocations.",
+                    file=sys.stderr,
+                )
+                sys.exit(1)
+            _master_password = _prompt_master_password_startup(_config_path)
+
     config = Config.load(_config_path)
-    global _active_log_file
     _active_log_file = config.log_file
     if config.encryption.get("encrypt_containers"):
         try:
