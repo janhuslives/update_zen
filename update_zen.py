@@ -1030,6 +1030,24 @@ def _get_named_volumes(inspect_data: dict) -> list[dict]:
     return result
 
 
+def _get_nonlocal_volumes(inspect_data: dict) -> list[dict]:
+    """Return named, non-anonymous volumes that have no local host path (non-local driver)."""
+    result = []
+    for m in inspect_data.get("Mounts", []):
+        if m.get("Type") != "volume":
+            continue
+        name = m.get("Name", "")
+        if re.match(r"^[0-9a-f]{64}$", name):
+            continue
+        if not m.get("Source", ""):
+            result.append({
+                "Name": name,
+                "Driver": m.get("Driver", ""),
+                "Destination": m.get("Destination", ""),
+            })
+    return result
+
+
 def _get_active_image_ref(config: "Config", container: str, inspect_data: dict) -> str:
     alts = config.registry_alternatives.get(container, {})
     active = alts.get("active", "")
@@ -2557,6 +2575,53 @@ class Engine:
             log(f"{prefix} network gateway: {', '.join(gateway_siblings)}")
         if dependent_siblings:
             log(f"{prefix} stack siblings: {', '.join(dependent_siblings)}")
+
+        # Pre-flight warning: non-local driver volumes cannot be backed up
+        nonlocal_vols = _get_nonlocal_volumes(inspect_data)
+        if nonlocal_vols:
+            log(f"{prefix} WARNING: {len(nonlocal_vols)} volume(s) use a non-local driver "
+                "and cannot be backed up")
+            print(f"\n  ⚠  Warning: {len(nonlocal_vols)} volume(s) for '{container}' "
+                  "cannot be backed up.")
+            print("     These volumes use a non-local storage driver with no accessible")
+            print("     host path. They will be skipped during backup. If a rollback is")
+            print("     needed, data on these volumes will not be restored.")
+            print()
+            for v in nonlocal_vols:
+                driver_str = f"  driver: {v['Driver']}" if v['Driver'] else ""
+                print(f"       • {v['Name']}  ({v['Destination']}){driver_str}")
+            print()
+            try:
+                yn = input("  Press Enter to continue, or type 'abort' to cancel: ").strip().lower()
+            except (EOFError, KeyboardInterrupt):
+                print("\n  Aborted.")
+                return False
+            if yn == "abort":
+                log(f"{prefix} update aborted by user (non-local volume warning)")
+                print("  Aborted.")
+                return False
+
+        # Pre-flight warning: compose file cannot be resolved
+        _labels = inspect_data.get("Config", {}).get("Labels") or {}
+        _working_dir = _labels.get("com.docker.compose.project.working_dir", "")
+        if _working_dir and not self._resolve_compose_dir(_working_dir, prefix):
+            log(f"{prefix} WARNING: compose file could not be resolved — "
+                "snapshot will not include a compose sidecar")
+            print(f"\n  ⚠  Warning: compose file not found for '{container}'.")
+            print("     The container has Docker Compose labels but the compose file")
+            print("     cannot be located on disk. This snapshot will not include a")
+            print("     compose sidecar. If a rollback is needed, the container will")
+            print("     be reconstructed from 'docker run' rather than 'docker compose up'.")
+            print()
+            try:
+                yn = input("  Press Enter to continue, or type 'abort' to cancel: ").strip().lower()
+            except (EOFError, KeyboardInterrupt):
+                print("\n  Aborted.")
+                return False
+            if yn == "abort":
+                log(f"{prefix} update aborted by user (compose file warning)")
+                print("  Aborted.")
+                return False
 
         # Step 3: snapshot then volume backup hook
         log(f"{prefix} saving config snapshot")
