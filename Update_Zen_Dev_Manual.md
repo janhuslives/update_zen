@@ -165,6 +165,15 @@ update_zen.py
 │     ├── _build_run_cmd()    builds docker run arg list
 │     └── run()               docker run + connect extra networks
 │
+├── # === ENCRYPTION ===
+├── _derive_key_from_salt()   scrypt KDF → 32-byte AES key
+├── _is_encrypted_file()      True if file starts with RBPE magic bytes
+├── class EncryptionManager
+│     ├── encrypt_bytes()     AES-256-GCM encrypt bytes → RBPE-prefixed ciphertext
+│     ├── decrypt_bytes()     decrypt RBPE-prefixed ciphertext → plaintext bytes
+│     ├── encrypt_file()      encrypt a file in-place via temp file
+│     └── decrypt_file()      decrypt a file in-place via temp file
+│
 ├── # === SNAPSHOT MANAGER ===
 ├── _sanitize_mount_name()    sanitize container path to a safe filename segment
 ├── _get_named_volumes()      filter Mounts[] for non-anonymous named volumes
@@ -385,6 +394,7 @@ into existing config files on the next run.
 | `registry_alternatives` | dict | `{}` | Container → `{refs, active}` — per-container registry source list; see `_get_active_image_ref()` |
 | `image_export_enabled` | bool | `True` | Global toggle — when True, saves image layers to `_image.tar` before each update |
 | `image_export_disabled` | list[str] | `[]` | Containers excluded from image export even when the global toggle is True |
+| `env_backup_disabled` | list[str] | `[]` | Containers excluded from env backup (the `_env.env` sidecar) even when other backup steps run. Managed per-container via the backup toggles menu (`c` → `b` → `2`). |
 | `snapshot_dir_overrides` | dict | `{}` | Container → path string; overrides global `snapshot_dir` for all snapshot and volume archive I/O for that container |
 | `pause_for_backup` | bool | `True` | Global toggle — when True, containers are paused during volume backup for consistency |
 | `pause_for_backup_disabled` | list[str] | `[]` | Containers that skip the pause step even when the global toggle is True |
@@ -414,7 +424,7 @@ Config.save() -> None
 ```
 Serializes current state to `config.json` as indented JSON. Always writes
 `"saved_passwords": {}` regardless of what is in memory — real passwords never
-reach `config.json`. Sets `config.json` permissions to `0644`.
+reach `config.json`. Sets `config.json` permissions to `0600`.
 
 #### Password storage model
 
@@ -859,7 +869,8 @@ callers must pass data from `DockerClient.inspect()` which augments the dict
 with image-level `RepoDigests` automatically.
 
 ```python
-RegistryClient.has_update(inspect_data: dict, image_ref_override: str = "") -> bool
+RegistryClient.has_update(inspect_data: dict, pinned_tag: str = "",
+                          image_ref_override: str = "") -> bool
 ```
 Compares the remote digest to the local digest. Returns `True` if they differ.
 Returns `False` if the image ref is missing or `RepoDigests` is empty (i.e.,
@@ -867,9 +878,14 @@ locally-built image with no registry digest). Raises `RegistryError` if the
 registry call fails — callers (`cmd_check`, `cmd_status`) catch this and display
 `"?"` with a logged warning rather than silently showing `"no"`.
 
+When `pinned_tag` is non-empty, the comparison is pin-aware: compares the local
+digest against the pinned tag's remote digest rather than the tag from
+`Config.Image`. Used by the interactive update check (`_updates_menu` option 5)
+and status display.
+
 When `image_ref_override` is non-empty, it is used as the image ref instead of
 reading `Config.Image` from `inspect_data`. Used by `_fetch_one_status`,
-`cmd_check`, `cmd_status`, and `_action_menu` choice 5 to pass the active
+`cmd_check`, `cmd_status`, and `_updates_menu` option 5 to pass the active
 registry alternative resolved by `_get_active_image_ref()`.
 
 Comparison strips the image name prefix from the local entry before comparing:
@@ -1179,9 +1195,10 @@ steps (meta, image, volumes) are non-fatal — failures are logged as warnings a
 the snapshot is still finalized. Each step is logged with the prefix
 `[SNAPSHOT <container>]`.
 
-Has no CLI subcommand. Exposed in the TUI via the `t` key in
-`_container_config_menu`. Useful for taking a manual checkpoint before a
-potentially risky config change without triggering a full update.
+CLI entry point: `update_zen snapshot <container>`. Also accessible in the TUI
+via the `n` key in `_snapshots_menu()` (the Snapshots submenu). Useful for
+taking a manual checkpoint before a potentially risky config change without
+triggering a full update.
 
 #### Engine._resolve_compose_dir()
 
@@ -1413,7 +1430,7 @@ another machine, or any time something seems misconfigured.
   `snapshot_dir_overrides`, and `volume_backup` path fields. Reports `✓` for
   portable `~/...` paths that exist, `!` for absolute NAS paths (expected but
   not portable), and `✗` for any configured path that does not exist on disk.
-- **Permissions** — checks `~/.update_zen/` (0700), `config.json` (0644),
+- **Permissions** — checks `~/.update_zen/` (0700), `config.json` (0600),
   `credentials.json` (0600), `update_zen.log` (0600).
 - **Snapshot Directories** — checks the global snapshot dir and any
   per-container override dirs. Shows snapshot counts per container. Reports `✗`
@@ -2685,7 +2702,7 @@ Three surfaces expose this:
   per-container overrides exist, the sweep can be scoped to skip those
   containers.
 
-- **Container config menu `m` key** (`_interactive_container_chmod`) — applies a
+- **Snapshots submenu `m` key** (`_interactive_container_chmod`) — applies a
   profile to one container's snapshot directories and saves the choice to
   `snapshot_permission_overrides[container]`. The menu header tags the active
   source as `[global default]` or `[container override]` on each visit.

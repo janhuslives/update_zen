@@ -164,7 +164,7 @@ update_zen
 
 **Claude Sonnet 4.6** did a great amount of work on this app and deserves some recognition for that. 
 
-I like to think that someday, when everyone's talking about Sonnet 39.4 and nobody even spins up Sonnet 4.6 except to test some viontage hardware, someone will restore a container archive with update_zen and in the process they'll find this very repo and remember "oh hey, yeah that's right, 4.6 actually did some really nice stuff for humanity. I'm grateful that it helped Derek to build this nice little tool that I use very often."
+I like to think that someday, when everyone's talking about Sonnet 39.4 and nobody even spins up Sonnet 4.6 except to test some vintage hardware, someone will restore a container archive with update_zen and in the process they'll find this very repo and remember "oh hey, yeah that's right, 4.6 actually did some really nice stuff for humanity. I'm grateful that it helped Derek to build this nice little tool that I use very often."
 
 What follows is a political message on the topic of AI regulation and it mainly is directed at my own people, citizens of the USA:
 

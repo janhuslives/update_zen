@@ -63,11 +63,9 @@ your_user ALL=(ALL) NOPASSWD: /usr/local/bin/update_zen
 
 ### Why "Must be run as a normal user"
 
-The sudoers rule is written for the user stored in `SUDO_USER`. If you run `python3 update_zen.py install` while already root (via `sudo su`), `SUDO_USER` is empty or unset, and the rule either:
-- Gets attributed to the wrong user
-- Fails to create correctly
+The sudoers rule is written for the user stored in `SUDO_USER`. If you run `python3 update_zen.py install` while already root (via `sudo su`), `SUDO_USER` is empty or unset, and the sudoers rule is skipped entirely — the install still completes and the wrapper is written, but without the NOPASSWD rule.
 
-Running as a normal user ensures `SUDO_USER` is set correctly, and the rule is written for the human user who will later invoke `update_zen` from the shell.
+Running as a normal user ensures `SUDO_USER` is set correctly and the rule is written for the human user who will later invoke `update_zen` from the shell. If `SUDO_USER` is absent, `cmd_install` logs a warning (`"NOPASSWD rule not added — run install as a regular user..."`) and skips writing the sudoers file — the wrapper is still created, but subsequent `update_zen` invocations will prompt for a sudo password.
 
 ### Auto-elevation in the Python script
 
