@@ -1295,12 +1295,17 @@ class SnapshotManager:
 
     def list(self, container: str) -> list:
         container_dir = self.config.snapshot_dir_for(container) / container
-        if not container_dir.exists():
+        try:
+            if not container_dir.exists():
+                return []
+            entries = list(container_dir.glob("*.tar.gz"))
+        except OSError as e:
+            log(f"Warning: snapshot dir unreachable for {container}: {container_dir} — {e}")
             return []
         snaps = []
         _ts_re = re.compile(r"^\d{4}-\d{2}-\d{2}T\d{2}-\d{2}-\d{2}$")
         _enc = EncryptionManager(self.config)
-        for path in container_dir.glob("*.tar.gz"):
+        for path in entries:
             snapshot_id = path.name.removesuffix(".tar.gz")
             if not _ts_re.match(snapshot_id):
                 continue
