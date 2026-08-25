@@ -1661,23 +1661,61 @@ class RegistryClient:
         digests = inspect_data.get("RepoDigests") or []
         return digests[0] if digests else None
 
+    def _get_json_with_link(self, url: str, extra_headers: dict = None) -> tuple:
+        """Like _get_json but also returns the RFC5988 Link 'next' URL, or None."""
+        req = urllib.request.Request(url)
+        for k, v in (extra_headers or {}).items():
+            req.add_header(k, v)
+        try:
+            with urllib.request.urlopen(req, timeout=10) as resp:
+                body = resp.read()
+                link_header = resp.headers.get("Link", "")
+        except urllib.error.HTTPError:
+            raise
+        except (urllib.error.URLError, TimeoutError, OSError) as e:
+            raise RegistryError(f"request failed for {url}: {e}") from e
+        if not body:
+            raise RegistryError(f"empty response from {url}")
+        try:
+            data = json.loads(body)
+        except json.JSONDecodeError as e:
+            raise RegistryError(f"invalid JSON from {url}: {e}") from e
+        m = re.search(r'<([^>]+)>;\s*rel="next"', link_header)
+        next_url = urllib.parse.urljoin(url, m.group(1)) if m else None
+        return data, next_url
+
     def list_tags(self, image_ref: str) -> list:
-        """Return all available tags for the image, sorted alphabetically."""
+        """Return all available tags for the image, sorted alphabetically.
+
+        Follows Link-header pagination (rel="next") to completion — some
+        registries (e.g. ghcr.io) cap a single /tags/list response at ~100
+        entries and would otherwise silently drop the rest, which can hide
+        real version tags depending on where they fall in registry order.
+        Capped at 50 pages as a runaway backstop.
+        """
         registry, repo, _ = self._parse_image_ref(image_ref)
         url = f"https://{registry}/v2/{repo}/tags/list"
-        try:
-            data = self._get_json(url)
-        except urllib.error.HTTPError as e:
-            if e.code != 401:
-                raise RegistryError(f"registry error for {image_ref}: {e.code} {e.reason}")
-            token = self._get_token(registry, e.headers.get("WWW-Authenticate", ""))
+        headers = {}
+        tags = []
+        pages = 0
+        while url and pages < 50:
             try:
-                data = self._get_json(url, {"Authorization": f"Bearer {token}"})
-            except urllib.error.HTTPError as e2:
-                raise RegistryError(f"auth failed for {image_ref}: {e2.code} {e2.reason}")
-        except (urllib.error.URLError, TimeoutError, OSError) as e:
-            raise RegistryError(f"registry unreachable for {image_ref}: {e}")
-        return sorted(data.get("tags") or [])
+                data, next_url = self._get_json_with_link(url, headers)
+            except urllib.error.HTTPError as e:
+                if e.code != 401 or headers:
+                    raise RegistryError(f"registry error for {image_ref}: {e.code} {e.reason}")
+                token = self._get_token(registry, e.headers.get("WWW-Authenticate", ""))
+                headers = {"Authorization": f"Bearer {token}"}
+                try:
+                    data, next_url = self._get_json_with_link(url, headers)
+                except urllib.error.HTTPError as e2:
+                    raise RegistryError(f"auth failed for {image_ref}: {e2.code} {e2.reason}")
+            except (urllib.error.URLError, TimeoutError, OSError) as e:
+                raise RegistryError(f"registry unreachable for {image_ref}: {e}")
+            tags.extend(data.get("tags") or [])
+            url = next_url
+            pages += 1
+        return sorted(set(tags))
 
     @staticmethod
     def _replace_tag(image_ref: str, new_tag: str) -> str:
@@ -1697,6 +1735,13 @@ class RegistryClient:
         "test", "testing", "canary", "next", "current",
         "prod", "production", "snapshot",
     })
+
+    # A version-like tag: optional 'v', a digit run, at least one more
+    # dot-separated digit run (so bare commit-SHA tags like "839abd28..."
+    # or "9c99c4067..." — which also start with a digit — don't qualify),
+    # and an optional dash/dot-separated build suffix (e.g. "-20260824230206",
+    # "-amd64", "-rc1").
+    _VERSION_TAG_RE = re.compile(r"^v?\d+(\.\d+){1,3}([.\-][0-9A-Za-z]+)*$")
 
     @staticmethod
     def _version_key(tag: str) -> tuple:
@@ -1755,8 +1800,8 @@ class RegistryClient:
 
         Each entry is (tag, date_str) where date_str is 'YYYY-MM-DD' or '?'
         when no date source is available for the registry. Tags are filtered
-        to version-like strings (start with a digit or 'v'+digit, not in
-        _NON_VERSION_TAGS). Sorted by date descending when dates are available,
+        to version-like strings matching _VERSION_TAG_RE and not in
+        _NON_VERSION_TAGS. Sorted by date descending when dates are available,
         falling back to semantic version order otherwise. Pass limit to cap results.
         """
         registry, repo, _ = self._parse_image_ref(image_ref)
@@ -1773,6 +1818,18 @@ class RegistryClient:
         elif registry == "ghcr.io":
             parts = repo.split("/", 1)
             dates = self._fetch_github_dates(parts[0], parts[1]) if len(parts) == 2 else {}
+            if dates:
+                # GitHub release tag names (e.g. 'v1.2.3') aren't guaranteed to
+                # match what's actually pushed to ghcr.io — some projects tag
+                # images differently (e.g. '1.2.3', '1.2.3-<build-timestamp>').
+                # Cross-check against the real registry tag list so we never
+                # offer/pin a tag that isn't actually pullable.
+                try:
+                    real_tags = set(self.list_tags(image_ref))
+                except RegistryError:
+                    real_tags = None
+                if real_tags is not None:
+                    dates = {t: d for t, d in dates.items() if t in real_tags}
         else:
             dates = {}
 
@@ -1781,7 +1838,7 @@ class RegistryClient:
             # most recently pushed tags, so no need to call list_tags at all.
             version_tags = [
                 t for t in dates
-                if t.lstrip("v")[:1].isdigit() and t.lower() not in self._NON_VERSION_TAGS
+                if self._VERSION_TAG_RE.match(t) and t.lower() not in self._NON_VERSION_TAGS
             ]
             combined = sorted(
                 [(t, dates[t]) for t in version_tags],
@@ -1796,7 +1853,7 @@ class RegistryClient:
                 return []
             version_tags = [
                 t for t in all_tags
-                if t.lstrip("v")[:1].isdigit() and t.lower() not in self._NON_VERSION_TAGS
+                if self._VERSION_TAG_RE.match(t) and t.lower() not in self._NON_VERSION_TAGS
             ]
             combined = sorted(
                 [(t, "?") for t in version_tags],
