@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-_VERSION = "2026-05-19a"
+_VERSION = "2026-08-25a"
 
 _TIPS = [
     "Use 'u' in the container list to batch update multiple containers at once.",
