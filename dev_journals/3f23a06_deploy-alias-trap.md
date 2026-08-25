@@ -88,3 +88,36 @@ round-trip time on this fix.
 | File | Change |
 |---|---|
 | `update_zen.py` | Bumped `_VERSION` from `"2026-05-19a"` to `"2026-08-25a"` — used as a deploy fingerprint to isolate which copy of the script was actually executing on the server. |
+
+## Addendum — cleanup executed (2026-08-25)
+
+Ran the cleanup, with one deviation from the default recommendation
+above: chose to **keep** passwordless sudo rather than delete the
+wrapper, so the wrapper was re-pointed instead of removed.
+
+1. `ssh -t derek@192.168.7.223 "sudo python3 /opt/update_zen/update_zen.py install"`
+   — re-ran `install` from the canonical path. This regenerated
+   `/usr/local/bin/update_zen` as `exec python3
+   /opt/update_zen/update_zen.py "$@"` and rewrote
+   `/etc/sudoers.d/update_zen`'s NOPASSWD rule to match (the rule text
+   itself is unchanged — it was always keyed to the wrapper path, not
+   the script path — but the wrapper it now guards finally points at
+   the right file).
+2. Verified over SSH that the wrapper's `exec` line and the sudoers
+   file both looked correct.
+3. `ssh derek@192.168.7.223 "rm ~/update_zen.py"` — removed the stray
+   copy that the alias had made irrelevant all along.
+4. Verification hit one false alarm: `ssh derek@192.168.7.223
+   "update_zen"` failed with the same
+   `Error: config.json is encrypted; cannot prompt for master password
+   in non-TTY mode.` seen earlier in this saga. That's expected —
+   a plain non-interactive `ssh host "cmd"` has no TTY for the
+   interactive TUI's master-password prompt, unrelated to sudo or to
+   the deploy itself. Confirmed correctly instead from an interactive
+   persistent session, where `update_zen` reports `2026-08-25a` and
+   runs with no sudo password prompt.
+
+End state: `/opt/update_zen/update_zen.py` is the single canonical
+copy. Both the alias and the `/usr/local/bin/update_zen` wrapper now
+resolve to it, so either lookup path lands on the same file.
+`~/update_zen.py` no longer exists.
