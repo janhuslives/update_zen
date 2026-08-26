@@ -1815,21 +1815,37 @@ class RegistryClient:
             namespace = parts[0]
             repo_name = parts[1] if len(parts) == 2 else parts[0]
             dates = self._fetch_hub_dates(namespace, repo_name)
-        elif registry == "ghcr.io":
+        elif registry in ("ghcr.io", "lscr.io"):
+            # lscr.io is LinuxServer's own registry domain, backed by ghcr.io
+            # (its 401 challenge points at ghcr.io/token) — same API shape.
             parts = repo.split("/", 1)
-            dates = self._fetch_github_dates(parts[0], parts[1]) if len(parts) == 2 else {}
-            if dates:
-                # GitHub release tag names (e.g. 'v1.2.3') aren't guaranteed to
-                # match what's actually pushed to ghcr.io — some projects tag
-                # images differently (e.g. '1.2.3', '1.2.3-<build-timestamp>').
-                # Cross-check against the real registry tag list so we never
-                # offer/pin a tag that isn't actually pullable.
-                try:
-                    real_tags = set(self.list_tags(image_ref))
-                except RegistryError:
-                    real_tags = None
-                if real_tags is not None:
-                    dates = {t: d for t, d in dates.items() if t in real_tags}
+            if len(parts) != 2:
+                dates = {}
+            else:
+                org, gh_repo = parts
+                # LinuxServer publishes images as ghcr.io/lscr.io "<org>/<app>",
+                # but the GitHub repo behind the release history is named
+                # "docker-<app>" (e.g. linuxserver/sabnzbd -> docker-sabnzbd).
+                if org == "linuxserver":
+                    gh_repo = f"docker-{gh_repo}"
+                dates = self._fetch_github_dates(org, gh_repo)
+                if dates:
+                    # GitHub release tag names (e.g. 'v1.2.3') aren't guaranteed
+                    # to match what's actually pushed to the registry — some
+                    # projects tag images differently. The registry's own
+                    # /tags/list can hold thousands of historical/per-arch tags
+                    # paginated oldest-first with no way to jump to recent ones,
+                    # so a full listing can't reliably confirm a recent tag
+                    # exists within any sane page cap — verify each candidate
+                    # directly instead, so we never offer/pin an unpullable tag.
+                    verified = {}
+                    for tag in dates:
+                        try:
+                            self.get_remote_digest(self._replace_tag(image_ref, tag))
+                            verified[tag] = dates[tag]
+                        except RegistryError:
+                            continue
+                    dates = verified
         else:
             dates = {}
 
