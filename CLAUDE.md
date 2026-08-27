@@ -61,6 +61,16 @@ python3 update_zen.py install   # run once as normal user — prompts for sudo p
 update_zen config               # opens config in $EDITOR / nano / vi
 ```
 
+### Deploying to the live server
+
+The canonical deployment target is `/opt/update_zen/update_zen.py` on `derek@192.168.7.223`. Both the shell's `update_zen` alias and the `/usr/local/bin/update_zen` wrapper resolve to this path — do not deploy to `~/update_zen.py` or `/usr/local/bin/update_zen` directly, those are stale locations from a past incident (see `dev_journals/3f23a06_deploy-alias-trap.md`) and writing to them silently has no effect on what actually runs.
+
+```
+scp update_zen.py derek@192.168.7.223:/tmp/update_zen.py && ssh derek@192.168.7.223 "sudo cp /tmp/update_zen.py /opt/update_zen/update_zen.py && rm /tmp/update_zen.py"
+```
+
+Goes via `/tmp` because `/opt` is root-owned. No `install` re-run is needed for routine deploys — that step only matters when rebuilding the wrapper/sudoers path itself.
+
 ## Architecture
 
 Everything lives in `update_zen.py`. Key classes in file order: `Config`, `DockerClient`, `EncryptionManager`, `SnapshotManager`, `RegistryClient`, `HealthChecker`, `Engine`, then `cmd_*()` functions and `main()`. See the function index below for navigation.
@@ -116,6 +126,14 @@ Portainer stores compose files at `/data/compose/<stack_id>/` **inside** its own
 ### `RegistryClient` digest comparison strips the image name prefix
 
 Local digest from `RepoDigests[0]`: `"nginx@sha256:abc123"` — remote digest from registry: `"sha256:abc123"`. Comparison strips everything before and including `@` from the local value.
+
+### `lscr.io` is a ghcr.io-backed registry, and LinuxServer's GitHub repo naming doesn't match its image naming
+
+`list_versions()` treats `lscr.io` (LinuxServer's registry domain) the same as `ghcr.io` — its 401 challenge names `ghcr.io/token` as the auth realm, confirming it's a proxy in front of ghcr.io with the same API. Do not add `lscr.io` as its own branch; keep it grouped with `ghcr.io`.
+
+When the org is `linuxserver`, the GitHub repo backing the release history is `docker-<app>`, not `<app>` (e.g. image `linuxserver/sabnzbd` → GitHub repo `linuxserver/docker-sabnzbd`). `list_versions()` applies this rewrite before calling `_fetch_github_dates()`.
+
+Never cross-check GitHub-release-derived tags against `list_tags()`'s enumeration for these registries: ghcr.io's `/tags/list` pagination returns tags **oldest-first** with no way to jump ahead, and LinuxServer images especially can carry thousands of historical/per-arch tags — the 50-page cap in `list_tags()` can run out long before reaching recent tags, silently dropping legitimate ones. `list_versions()` instead verifies each GitHub-release candidate directly with `get_remote_digest()` (a single HEAD request per candidate).
 
 ### Snapshot format: `.tar.gz` bundle
 
